@@ -1,0 +1,50 @@
+# appspec.yml - AWS CodeDeploy (Linux)
+# PURPOSE
+# - Instructs CodeDeploy how to place files and which lifecycle hooks to run.
+# - Hook order: ApplicationStop → BeforeInstall → AfterInstall → ApplicationStart → ValidateService
+# CRITICAL
+# - This file MUST be at the ROOT of your deployment ZIP bundle.
+# - CodeDeploy agent must be installed & running on target EC2 instances.
+
+version: 0.0
+os: linux
+
+files:
+  # Copy content under app/ in the bundle → target path on instance
+  - source: app/
+    destination: /var/www/your-app # ← CHANGE to your app directory
+    overwrite: true
+
+permissions:
+  # Ensure runtime user owns the deployed files and has execute bits where needed
+  - object: /var/www/your-app
+    owner: ec2-user # ← CHANGE to the user that runs your app
+    group: ec2-user
+    mode: 755
+    type:
+      - file
+      - directory
+    pattern: "**/*"
+
+hooks:
+  # Non-zero exit code in any script fails the deployment (and may roll back).
+  ApplicationStop:
+    - location: scripts/application_stop.sh
+      timeout: 180
+      runas: root
+  BeforeInstall:
+    - location: scripts/before_install.sh
+      timeout: 300
+      runas: root
+  AfterInstall:
+    - location: scripts/after_install.sh
+      timeout: 900
+      runas: root
+  ApplicationStart:
+    - location: scripts/application_start.sh
+      timeout: 300
+      runas: root
+  ValidateService:
+    - location: scripts/validate_service.sh
+      timeout: 120
+      runas: root

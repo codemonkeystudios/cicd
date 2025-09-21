@@ -1,0 +1,41 @@
+# appspec.yml - AWS CodeDeploy (Linux)
+
+version: 0.0
+os: linux
+
+files:
+  - source: app/
+    destination: /var/www/your-app
+    overwrite: true
+
+permissions:
+  - object: /var/www/your-app
+    owner: ec2-user
+    group: ec2-user
+    mode: 755
+    type:
+      - file
+      - directory
+    pattern: "**/*"
+
+hooks:
+  ApplicationStop:
+    - location: scripts/application_stop.sh
+      timeout: 180
+      runas: root
+  BeforeInstall:
+    - location: scripts/before_install.sh
+      timeout: 300
+      runas: root
+  AfterInstall:
+    - location: scripts/after_install.sh
+      timeout: 900
+      runas: root
+  ApplicationStart:
+    - location: scripts/application_start.sh
+      timeout: 300
+      runas: root
+  ValidateService:
+    - location: scripts/validate_service.sh
+      timeout: 120
+      runas: root

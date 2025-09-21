@@ -1,0 +1,57 @@
+# buildspec.yml - CodeBuild (Package Artifact for CodeDeploy)
+# WHAT THIS DOES
+# - Packages a CodeDeploy-compatible artifact with:
+#     * appspec.yml  (must be at artifact root)
+#     * scripts/     (lifecycle hooks)
+#     * app/         (your application code)
+# - Emits the ZIP to the CodeBuild artifact output for CodePipeline to pass to
+#   CodeDeploy in the next stage.
+#
+# ASSUMPTIONS
+# - CodePipeline provides a source artifact cloned from AWS CodeCommit.
+# - CodePipeline also configures CodeBuild artifacts to "ZIP" the contents of
+#   the directory specified here (see artifacts: files below).
+
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    commands:
+      - |
+        set -euo pipefail
+        echo "[install] Installing zip and basic tooling…"
+        if command -v yum >/dev/null 2>&1; then
+          yum -y install zip unzip || true
+        elif command -v apt-get >/dev/null 2>&1; then
+          apt-get update -y || true
+          apt-get install -y zip unzip || true
+        fi
+
+  pre_build:
+    commands:
+      - |
+        set -euo pipefail
+        echo "[pre_build] Validating required files are present…"
+        test -f appspec.yml || { echo "Missing appspec.yml at repo root"; exit 1; }
+        test -d scripts || { echo "Missing scripts/ directory"; exit 1; }
+        test -d app || { echo "Missing app/ directory"; exit 1; }
+
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        echo "[build] Creating deployment ZIP structure…"
+        mkdir -p dist
+        zip -r "dist/bundle-${CODEBUILD_RESOLVED_SOURCE_VERSION}.zip"
+           appspec.yml
+           scripts/
+           app/
+        ls -lh dist
+
+artifacts:
+  # Export the ZIP so CodePipeline can hand it to CodeDeploy
+  files:
+    - dist/bundle-*.zip

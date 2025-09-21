@@ -1,0 +1,85 @@
+# GitLab CI/CD → AWS CodeDeploy (EC2/On-Prem)
+#
+# WHAT THIS PIPELINE DOES
+# 1) Uses GitLab OIDC to fetch a short-lived ID token (no long-lived keys).
+# 2) Exchanges token for AWS creds via STS assume-role-with-web-identity.
+# 3) Zips appspec.yml + scripts/ + app/ into a bundle.
+# 4) Uploads to S3, triggers CodeDeploy, waits for success.
+
+image: ubuntu:22.04
+
+variables:
+  AWS_REGION: "us-east-1"
+  S3_BUCKET: "your-codedeploy-bucket"
+  S3_KEY_PREFIX: "releases/your-app"
+  CODEDEPLOY_APPLICATION: "your-app"
+  CODEDEPLOY_DEPLOYMENT_GROUP: "prod"
+  PACKAGE_NAME: "bundle-$CI_COMMIT_SHA.zip"
+  AWS_ROLE_ARN: "arn:aws:iam::123456789012:role/GitLabOIDC-CodeDeploy"  # ← CHANGE
+
+id_tokens:
+  AWS_ID_TOKEN:
+    aud: "sts.amazonaws.com"
+
+stages:
+  - package
+  - deploy
+
+before_script:
+  - set -euo pipefail
+  - apt-get update -y
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl unzip zip jq awscli
+  - echo "[auth] Assuming role $AWS_ROLE_ARN using GitLab OIDC…"
+  - |
+    CRED_JSON=$(aws sts assume-role-with-web-identity
+      --role-arn "$AWS_ROLE_ARN"
+      --role-session-name "gitlab-ci-codedeploy-$CI_PIPELINE_ID"
+      --web-identity-token "$AWS_ID_TOKEN"
+      --duration-seconds 3600
+      --query 'Credentials' --output json)
+  - export AWS_ACCESS_KEY_ID=$(echo "$CRED_JSON" | jq -r .AccessKeyId)
+  - export AWS_SECRET_ACCESS_KEY=$(echo "$CRED_JSON" | jq -r .SecretAccessKey)
+  - export AWS_SESSION_TOKEN=$(echo "$CRED_JSON" | jq -r .SessionToken)
+  - export AWS_DEFAULT_REGION="$AWS_REGION"
+
+package:
+  stage: package
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - echo "[package] Creating CodeDeploy bundle…"
+    - mkdir -p dist
+    - |
+      zip -r "dist/$PACKAGE_NAME"
+        appspec.yml
+        scripts/
+        app/
+    - echo "[package] Bundle created: dist/$PACKAGE_NAME"
+  artifacts:
+    when: on_success
+    expire_in: 1 week
+    paths:
+      - dist/$PACKAGE_NAME
+
+deploy:
+  stage: deploy
+  needs: ["package"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - echo "[deploy] Uploading bundle to s3://$S3_BUCKET/$S3_KEY_PREFIX/$PACKAGE_NAME"
+    - |
+      aws s3 cp "dist/$PACKAGE_NAME"
+        "s3://$S3_BUCKET/$S3_KEY_PREFIX/$PACKAGE_NAME"
+    - echo "[deploy] Creating CodeDeploy deployment…"
+    - |
+      DEPLOYMENT_ID=$(aws deploy create-deployment
+        --application-name "$CODEDEPLOY_APPLICATION"
+        --deployment-group-name "$CODEDEPLOY_DEPLOYMENT_GROUP"
+        --deployment-config-name CodeDeployDefault.AllAtOnce
+        --s3-location bucket="$S3_BUCKET",key="$S3_KEY_PREFIX/$PACKAGE_NAME",bundleType=zip
+        --query "deploymentId" --output text)
+      echo "DEPLOYMENT_ID=$DEPLOYMENT_ID"
+    - echo "[deploy] Waiting for deployment to complete…"
+    - aws deploy wait deployment-successful --deployment-id "$DEPLOYMENT_ID"
+    - echo "[deploy] Deployment completed successfully."

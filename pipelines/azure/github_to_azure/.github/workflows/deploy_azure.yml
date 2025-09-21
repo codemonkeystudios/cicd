@@ -1,0 +1,147 @@
+# GitHub Actions → Microsoft Azure (Linux VM over AAD SSH)
+#
+# WHAT THIS WORKFLOW DOES
+# 1) Uses GitHub OIDC + Azure Federated Credentials to log in via azure/login
+#    (NO client secrets stored in GitHub).
+# 2) Packages a deployment bundle (scripts/ + app/) as a ZIP.
+# 3) Uploads the bundle to Azure Storage (Blob).
+# 4) SSHes into an Azure Linux VM using **AAD-based SSH** (az ssh vm) and runs
+#    an on‑VM orchestrator that executes lifecycle hooks in order:
+#      stop → before_install → rsync → after_install → start → validate.
+#
+# PREREQUISITES (ONE‑TIME AZURE SETUP)
+# - Entra ID App Registration with **federated credential** for this GitHub repo.
+#   Grant the app minimal roles on the target resources, for example:
+#     - Storage Blob Data Contributor (scope: storage account or container)
+#     - Virtual Machine Administrator Login (for AAD SSH) OR VM User Login + sudo policy
+#     - (Optional) Reader on the VM resource group
+# - Target VM must have the **AADLoginForLinux** extension enabled.
+# - Create a Storage account + container for release bundles.
+# - Ensure the VM can reach the internet to download the bundle, and has unzip/rsync.
+#
+# SECURITY NOTES
+# - No long‑lived client secrets. We use OIDC + federated creds.
+# - We generate a **short‑lived SAS** for the uploaded blob and pass that URL
+#   to the VM. Prefer private network access + managed identity if your VM has it.
+
+name: deploy-to-azure
+
+on:
+  push:
+    branches: [ "main" ]     # ← change to your release branch(es)
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write             # For OIDC → azure/login
+  contents: read
+
+env:
+  # EDIT THESE FOR YOUR ENVIRONMENT
+  # Azure login (use repo secrets for these identifiers)
+  AZURE_TENANT_ID:        ${{ secrets.AZURE_TENANT_ID }}        # Entra ID tenant
+  AZURE_SUBSCRIPTION_ID:  ${{ secrets.AZURE_SUBSCRIPTION_ID }}  # Subscription
+  AZURE_CLIENT_ID:        ${{ secrets.AZURE_CLIENT_ID }}        # App reg (federated)
+  # Storage for bundles
+  AZURE_STORAGE_ACCOUNT:  yourstorageacct           # must exist
+  AZURE_STORAGE_CONTAINER: releases                  # must exist
+  BLOB_PREFIX:            your-app/                  # optional prefix; can be empty
+  PACKAGE_NAME:           bundle-${{ github.sha }}.zip
+  SAS_EXPIRY_MINUTES:     "30"                       # short-lived SAS window
+  # Target VM details
+  AZ_RESOURCE_GROUP:      your-rg
+  AZ_VM_NAME:             your-vm-name
+  AZ_VM_LOCATION:         eastus                     # used by az ssh vm
+  APP_DIR:                /var/www/your-app          # where app files live on the VM
+
+jobs:
+  package-and-deploy:
+    name: Package & Deploy
+    runs-on: ubuntu-22.04
+
+    steps:
+      # 1) Checkout source at the commit that triggered this run.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2) Log in to Azure using OIDC + federated credentials (NO client secret).
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id:       ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+          client-id:       ${{ env.AZURE_CLIENT_ID }}
+
+      # 3) Install Azure CLI extensions we need (ssh, storage-preview) and tools.
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y zip rsync jq
+          # Ensure az ssh is available
+          az extension add --name ssh --only-show-errors || az extension update --name ssh --only-show-errors
+          # storage-preview can help with newer storage commands (optional)
+          az extension add --name storage-preview --only-show-errors || true
+
+      # 4) Create the deployment bundle containing scripts/ and app/.
+      - name: Build deployment bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          zip -r "dist/${{ env.PACKAGE_NAME }}"             scripts/             app/
+          ls -lh dist
+
+      # 5) Upload the bundle to Azure Blob Storage and generate a short‑lived SAS.
+      #    We prefer scoped SAS (minutes) over account keys.
+      - name: Upload bundle + generate SAS URL
+        id: sas
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CONTAINER="${{ env.AZURE_STORAGE_CONTAINER }}"
+          ACCOUNT="${{ env.AZURE_STORAGE_ACCOUNT }}"
+          NAME="${{ env.BLOB_PREFIX }}${{ env.PACKAGE_NAME }}"
+
+          echo "[storage] Uploading ${NAME} to container ${CONTAINER} in account ${ACCOUNT}"
+          az storage blob upload             --account-name "${ACCOUNT}"             --container-name "${CONTAINER}"             --name "${NAME}"             --file "dist/${{ env.PACKAGE_NAME }}"             --auth-mode login             --overwrite true             --only-show-errors
+
+          # Expiry in ISO format (UTC)
+          EXPIRY="$(date -u -d "+${{ env.SAS_EXPIRY_MINUTES }} minutes" +"%Y-%m-%dT%H:%MZ")"
+
+          echo "[storage] Generating read-only SAS valid until ${EXPIRY}"
+          SAS_TOKEN="$(az storage blob generate-sas             --account-name "${ACCOUNT}"             --container-name "${CONTAINER}"             --name "${NAME}"             --permissions r             --expiry "${EXPIRY}"             --auth-mode login             --as-user             --output tsv)"
+
+          SAS_URL="https://${ACCOUNT}.blob.core.windows.net/${CONTAINER}/${NAME}?${SAS_TOKEN}"
+          echo "sas_url=${SAS_URL}" >> "$GITHUB_OUTPUT"
+
+      # 6) SSH (AAD) to the Azure VM and run the orchestrator.
+      #    The orchestrator will download the ZIP via the SAS URL, unzip, chmod,
+      #    export APP_DIR, and run lifecycle hooks.
+      - name: Deploy on Azure VM (AAD SSH)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SAS_URL="${{ steps.sas.outputs.sas_url }}"
+          echo "[deploy] Connecting to ${{ env.AZ_VM_NAME }} (resource group: ${{ env.AZ_RESOURCE_GROUP }})"
+          az ssh vm             --name "${{ env.AZ_VM_NAME }}"             --resource-group "${{ env.AZ_RESOURCE_GROUP }}"             --local-user "azureuser"             --prefer-public-ip             --             'sudo bash -lc "
+               set -euo pipefail
+
+               mkdir -p /tmp/deploy && cd /tmp/deploy
+               rm -rf extracted && mkdir -p extracted
+
+               echo "[AZ-DEPLOY] Downloading bundle via SAS…"
+               curl -sSLo /tmp/deploy/bundle.zip "'${SAS_URL}'"
+
+               echo "[AZ-DEPLOY] Unzipping bundle…"
+               unzip -o /tmp/deploy/bundle.zip -d extracted
+
+               echo "[AZ-DEPLOY] Making scripts executable…"
+               chmod +x extracted/scripts/*.sh
+
+               export APP_DIR="${{ env.APP_DIR }}"
+               echo "[AZ-DEPLOY] Running orchestrator…"
+               bash extracted/scripts/az_vm_run_deploy.sh
+             "'
+

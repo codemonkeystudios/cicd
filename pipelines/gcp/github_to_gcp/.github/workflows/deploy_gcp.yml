@@ -1,0 +1,75 @@
+# GitHub Actions → Google Cloud (GCE VM)
+name: deploy-to-gcp
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  GCP_PROJECT_ID:        "your-project-id"
+  GCP_WIF_PROVIDER:      "projects/1234567890/locations/global/workloadIdentityPools/POOL/providers/GITHUB"
+  GCP_SERVICE_ACCOUNT:   "deploy-sa@your-project-id.iam.gserviceaccount.com"
+  GCS_BUCKET:            "your-deploy-bucket"
+  BLOB_PREFIX:           "releases/your-app/"
+  PACKAGE_NAME:          "bundle-${{ github.sha }}.zip"
+  GCE_INSTANCE:          "your-instance-name"
+  GCE_ZONE:              "us-central1-a"
+  APP_DIR:               "/var/www/your-app"
+  USE_IAP:               "false"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Auth to Google via WIF (no keys)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y zip jq rsync
+      - name: Build bundle
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          zip -r "dist/${{ env.PACKAGE_NAME }}" scripts/ app/
+          ls -lh dist
+      - name: Upload to GCS
+        run: |
+          set -euo pipefail
+          gsutil cp "dist/${{ env.PACKAGE_NAME }}" "gs://${{ env.GCS_BUCKET }}/${{ env.BLOB_PREFIX }}${{ env.PACKAGE_NAME }}"
+      - name: Deploy on VM via SSH
+        run: |
+          set -euo pipefail
+          EXTRA_FLAGS=""
+          if [[ "${{ env.USE_IAP }}" == "true" ]]; then
+            EXTRA_FLAGS="--tunnel-through-iap"
+          fi
+          gcloud compute ssh ${EXTRA_FLAGS} "${{ env.GCE_INSTANCE }}"             --zone "${{ env.GCE_ZONE }}"             --command '
+              sudo bash -lc "
+                set -euo pipefail
+                mkdir -p /tmp/deploy/extracted
+                cd /tmp/deploy
+                gsutil cp gs://${{ env.GCS_BUCKET }}/${{ env.BLOB_PREFIX }}${{ env.PACKAGE_NAME }} /tmp/deploy/bundle.zip
+                rm -rf extracted && mkdir -p extracted
+                unzip -o /tmp/deploy/bundle.zip -d extracted
+                chmod +x extracted/scripts/*.sh
+                export APP_DIR="${{ env.APP_DIR }}"
+                bash extracted/scripts/gcp_vm_run_deploy.sh
+              "
+            '

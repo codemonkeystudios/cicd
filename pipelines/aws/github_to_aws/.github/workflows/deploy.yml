@@ -1,0 +1,108 @@
+# GitHub → AWS EC2 via CodeDeploy
+#
+# WHAT THIS DOES
+# - Uses GitHub OIDC to get short-lived AWS credentials (no long-lived keys).
+# - Zips appspec.yml + scripts/ + app/ into a bundle.
+# - Uploads to S3.
+# - Triggers AWS CodeDeploy to roll out to your EC2 instances.
+#
+# REQUIREMENTS (one-time in AWS)
+# 1) IAM OIDC trust for GitHub is built-in. Create an IAM ROLE with a trust
+#   policy that allows your repository to assume it via OIDC.
+#   Example condition keys to scope tightly:
+#     - token.actions.githubusercontent.com:sub -> repo:<owner>/<repo>:ref:refs/heads/main
+#     - token.actions.githubusercontent.com:aud -> sts.amazonaws.com
+# 2) Attach a policy to the role with MINIMUM permissions:
+#    - s3:PutObject, s3:GetObject on s3://<bucket>/<prefix>/*
+#    - s3:ListBucket on the bucket (prefix-scoped if possible)
+#    - codedeploy:CreateDeployment, GetDeployment, GetDeploymentConfig, ListDeployments
+#    - codedeploy:RegisterApplicationRevision (optional)
+# 3) CodeDeploy Application + Deployment Group targeting your EC2 instances.
+#    Ensure the CodeDeploy agent is installed and running on instances.
+#
+# NOTES
+# - Long shell commands are split across multiple lines for readability.
+# - Fail-fast settings (set -euo pipefail) for safer scripts.
+# - The appspec.yml must be at the ROOT of the zip bundle.
+
+name: deploy-to-aws
+
+on:
+  push:
+    branches: [ "main" ]   # ← change if your release branch differs
+  workflow_dispatch: {}
+
+env:
+  AWS_REGION: "us-east-1"                        # ← change to your region
+  S3_BUCKET: "your-codedeploy-bucket"            # ← existing S3 bucket
+  S3_KEY_PREFIX: "releases/your-app"             # ← "folder" within the bucket
+  CODEDEPLOY_APPLICATION: "your-app"             # ← existing CodeDeploy app
+  CODEDEPLOY_DEPLOYMENT_GROUP: "prod"            # ← existing deployment group
+  PACKAGE_NAME: "bundle-${{ github.sha }}.zip"   # unique bundle per commit
+
+jobs:
+  package-and-deploy:
+    name: Package & Deploy
+    runs-on: ubuntu-22.04
+
+    permissions:
+      # Required for OIDC → STS
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/GitHubOIDC-CodeDeploy   # ← change
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y zip jq
+
+      - name: Build deployment bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          zip -r "dist/${{ env.PACKAGE_NAME }}"
+             appspec.yml
+             scripts/
+             app/
+          ls -lh dist
+
+      - name: Upload bundle to S3
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws s3 cp
+             "dist/${{ env.PACKAGE_NAME }}"
+             "s3://${{ env.S3_BUCKET }}/${{ env.S3_KEY_PREFIX }}/${{ env.PACKAGE_NAME }}"
+
+      - name: Create CodeDeploy deployment
+        id: deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEPLOYMENT_ID=$(aws deploy create-deployment
+           --application-name "${{ env.CODEDEPLOY_APPLICATION }}"
+           --deployment-group-name "${{ env.CODEDEPLOY_DEPLOYMENT_GROUP }}"
+           --deployment-config-name "CodeDeployDefault.AllAtOnce" \  # safer: HalfAtATime
+            --s3-location bucket="${{ env.S3_BUCKET }}",key="${{ env.S3_KEY_PREFIX }}/${{ env.PACKAGE_NAME }}",bundleType=zip             --query "deploymentId"             --output text)
+          echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}"
+          echo "deployment_id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deployment to succeed
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws deploy wait deployment-successful
+            --deployment-id "${{ steps.deploy.outputs.deployment_id }}"
+          echo "[deploy] Deployment completed successfully."

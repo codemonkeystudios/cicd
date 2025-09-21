@@ -1,0 +1,147 @@
+# GitLab CI/CD → Microsoft Azure (Linux VM over AAD SSH)
+#
+# WHAT THIS PIPELINE DOES
+# 1) Uses GitLab OIDC to obtain a short‑lived ID token at runtime (no client secrets).
+# 2) Logs into Azure with that token using **federated credentials** (service principal).
+# 3) Packages a deployment bundle (scripts/ + app/) as a ZIP.
+# 4) Uploads the bundle to Azure Blob Storage.
+# 5) SSHes into an Azure Linux VM using **AAD‑based SSH** (`az ssh vm`) and runs an
+#    on‑VM orchestrator that executes lifecycle hooks in order:
+#      stop → before_install → rsync → after_install → start → validate.
+#
+# PREREQUISITES (ONE‑TIME AZURE SETUP)
+# - Entra ID App Registration (Service Principal) with a **Federated Credential**
+#   that trusts GitLab as an OIDC issuer and restricts to this project/ref.
+# - Assign least‑privilege roles to the Service Principal, for example:
+#     - Storage Blob Data Contributor (scope: storage account or container)
+#     - Virtual Machine Administrator Login (or User Login + sudo policy) on the VM/RG
+#     - (Optional) Reader on the VM resource group
+# - Target VM must have the **AADLoginForLinux** extension enabled.
+# - Create a Storage account + container for release bundles.
+#
+# SECURITY NOTES
+# - No long‑lived client secrets. We use OIDC + federated creds.
+# - We generate a **short‑lived SAS** for the uploaded blob and pass that URL to the VM.
+#   Prefer private network + managed identity on the VM, if available.
+
+image: ubuntu:22.04
+
+# Variables to edit
+variables:
+  # Azure login identifiers (use GitLab CI/CD variables; do NOT hardcode secrets)
+  AZURE_TENANT_ID:        "00000000-0000-0000-0000-000000000000"   # ← CHANGE
+  AZURE_SUBSCRIPTION_ID:  "00000000-0000-0000-0000-000000000000"   # ← CHANGE
+  AZURE_CLIENT_ID:        "00000000-0000-0000-0000-000000000000"   # ← CHANGE (App Registration / SPN)
+
+  # Storage for bundles
+  AZURE_STORAGE_ACCOUNT:  "yourstorageacct"     # must exist
+  AZURE_STORAGE_CONTAINER: "releases"           # must exist
+  BLOB_PREFIX:            "your-app/"           # optional prefix (can be empty)
+  PACKAGE_NAME:           "bundle-$CI_COMMIT_SHA.zip"
+  SAS_EXPIRY_MINUTES:     "30"                  # short‑lived SAS expiry
+
+  # Target VM details
+  AZ_RESOURCE_GROUP:      "your-rg"
+  AZ_VM_NAME:             "your-vm-name"
+  AZ_VM_LOCATION:         "eastus"              # required by az ssh vm
+  APP_DIR:                "/var/www/your-app"   # where app files live on the VM
+
+# Request a GitLab OIDC ID token
+# The token will be injected into $AZURE_ID_TOKEN (JWT) at runtime.
+# Azure typically expects audience: "api://AzureADTokenExchange", but your
+# federated credential can specify a different audience — keep them consistent.
+id_tokens:
+  AZURE_ID_TOKEN:
+    aud: "api://AzureADTokenExchange"
+
+stages:
+  - package
+  - deploy
+
+# Shared setup for jobs
+before_script:
+  - set -euo pipefail
+  - apt-get update -y
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends       ca-certificates curl unzip zip jq rsync apt-transport-https lsb-release gnupg
+  # Install Azure CLI (official Microsoft repo)
+  - |
+    set -euo pipefail
+    echo "[setup] Installing Azure CLI…"
+    curl -sL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | tee /etc/apt/trusted.gpg.d/microsoft.gpg >/dev/null
+    AZ_REPO=$(lsb_release -cs)
+    echo "deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ $AZ_REPO main" > /etc/apt/sources.list.d/azure-cli.list
+    apt-get update -y
+    apt-get install -y azure-cli
+  # Login to Azure using OIDC federated token (NO client secret)
+  - |
+    set -euo pipefail
+    echo "[auth] Logging into Azure via federated token…"
+    az login       --service-principal       --tenant "${AZURE_TENANT_ID}"       --username "${AZURE_CLIENT_ID}"       --federated-token "${AZURE_ID_TOKEN}"       --only-show-errors
+    az account set --subscription "${AZURE_SUBSCRIPTION_ID}"
+  # Ensure az ssh is available
+  - az extension add --name ssh --only-show-errors || az extension update --name ssh --only-show-errors
+  # storage-preview can help with newer storage commands (optional)
+  - az extension add --name storage-preview --only-show-errors || true
+
+package:
+  stage: package
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - echo "[package] Creating deployment bundle…"
+    - mkdir -p dist
+    - |
+      # There is no appspec.yml on Azure; we bundle scripts/ and app/.
+      zip -r "dist/$PACKAGE_NAME"         scripts/         app/
+    - echo "[package] Bundle created: dist/$PACKAGE_NAME"
+  artifacts:
+    when: on_success
+    expire_in: 1 week
+    paths:
+      - dist/$PACKAGE_NAME
+
+deploy:
+  stage: deploy
+  needs: ["package"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    # Upload bundle to Azure Blob
+    - |
+      set -euo pipefail
+      CONTAINER="${AZURE_STORAGE_CONTAINER}"
+      ACCOUNT="${AZURE_STORAGE_ACCOUNT}"
+      NAME="${BLOB_PREFIX}${PACKAGE_NAME}"
+
+      echo "[storage] Uploading ${NAME} to container ${CONTAINER} in account ${ACCOUNT}"
+      az storage blob upload         --account-name "${ACCOUNT}"         --container-name "${CONTAINER}"         --name "${NAME}"         --file "dist/${PACKAGE_NAME}"         --auth-mode login         --overwrite true         --only-show-errors
+
+      EXPIRY="$(date -u -d "+${SAS_EXPIRY_MINUTES} minutes" +"%Y-%m-%dT%H:%MZ")"
+      echo "[storage] Generating read-only SAS valid until ${EXPIRY}"
+      SAS_TOKEN="$(az storage blob generate-sas         --account-name "${ACCOUNT}"         --container-name "${CONTAINER}"         --name "${NAME}"         --permissions r         --expiry "${EXPIRY}"         --auth-mode login         --as-user         --output tsv)"
+      SAS_URL="https://${ACCOUNT}.blob.core.windows.net/${CONTAINER}/${NAME}?${SAS_TOKEN}"
+      echo "SAS_URL=${SAS_URL}"
+
+    # SSH into VM & orchestrate
+    - |
+      set -euo pipefail
+      echo "[deploy] Connecting to VM '${AZ_VM_NAME}' in resource group '${AZ_RESOURCE_GROUP}'…"
+      az ssh vm         --name "${AZ_VM_NAME}"         --resource-group "${AZ_RESOURCE_GROUP}"         --local-user "azureuser"         --prefer-public-ip         --         'sudo bash -lc "
+           set -euo pipefail
+
+           mkdir -p /tmp/deploy && cd /tmp/deploy
+           rm -rf extracted && mkdir -p extracted
+
+           echo "[AZ-DEPLOY] Downloading bundle via SAS…"
+           curl -sSLo /tmp/deploy/bundle.zip "'${SAS_URL}'"
+
+           echo "[AZ-DEPLOY] Unzipping bundle…"
+           unzip -o /tmp/deploy/bundle.zip -d extracted
+
+           echo "[AZ-DEPLOY] Making scripts executable…"
+           chmod +x extracted/scripts/*.sh
+
+           export APP_DIR="'${APP_DIR}'"
+           echo "[AZ-DEPLOY] Running orchestrator…"
+           bash extracted/scripts/az_vm_run_deploy.sh
+         "'

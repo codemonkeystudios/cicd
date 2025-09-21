@@ -1,0 +1,105 @@
+version: "3.9"
+
+services:
+  coldfusion:
+    image: adobecoldfusion/coldfusion2025:latest
+    container_name: acf2023
+    ports:
+      - "8500:8500"             # http://localhost:8500
+    environment:
+      # These are *for your code/config* to read (not auto-wired by the image).
+      # Use CFConfig or the CF Admin to make a datasource; this just standardizes envs.
+      - DB_CLIENT=mysql         # or mssql / postgres
+      - DB_HOST=mysql           # match the service you enable below
+      - DB_PORT=3306            # 1433 (MSSQL), 5432 (Postgres)
+      - DB_DATABASE=testdb
+      - DB_USER=root
+      - DB_PASSWORD=SuperSecurePassword123
+
+      # Optional: timezone, JVM heap, etc. (examples)
+      # - TZ=UTC
+      # - JVM_ARGS=-Xms512m -Xmx1024m
+
+      # If you’re using CFSetup/CFConfig on container start, you can pass flags here.
+      # e.g., CFSetup JSON path or admin password variables (handled by your entrypoint).
+      # - CFSETUP_JSON=/app/.cfsetup.json
+      # - CF_ADMIN_PASSWORD=ChangeMe!
+    volumes:
+      - ./app:/app
+    # Uncomment a DB you enable below and add it here:
+    # depends_on:
+    #   - mysql
+    # depends_on:
+    #   - mssql
+    # depends_on:
+    #   - postgres
+
+  # CHOOSE ONE DATABASE BELOW AND UNCOMMENT IT
+  #
+  # MySQL 8 (multi-arch: ARM64/AMD64) — recommended on Apple Silicon
+  # mysql:
+  #   image: mysql:8.0
+  #   container_name: mysql
+  #   # On Apple Silicon you can force native ARM if Docker guesses wrong:
+  #   # platform: linux/arm64/v8
+  #   environment:
+  #     - MYSQL_ROOT_PASSWORD=SuperSecurePassword123
+  #     - MYSQL_DATABASE=testdb
+  #     # Optional app user:
+  #     # - MYSQL_USER=appuser
+  #     # - MYSQL_PASSWORD=AppUserPassword!
+  #   ports:
+  #     - "3306:3306"
+  #   volumes:
+  #     - mysql_data:/var/lib/mysql
+  #   healthcheck:
+  #     test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #
+  # Microsoft SQL Server 2022 (AMD64 only) — emulation on Apple Silicon
+  # mssql:
+  #   image: mcr.microsoft.com/mssql/server:2022-latest
+  #   container_name: mssql
+  #   platform: linux/amd64   # REQUIRED on Apple Silicon
+  #   environment:
+  #     - ACCEPT_EULA=Y
+  #     - SA_PASSWORD=SuperSecurePassword123
+  #     - MSSQL_PID=Developer
+  #   ports:
+  #     - "1433:1433"
+  #   volumes:
+  #     - mssql_data:/var/opt/mssql
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P SuperSecurePassword123 -No -Q \"SELECT 1\" -C || exit 1"]
+  #     interval: 15s
+  #     timeout: 10s
+  #     retries: 6
+  #
+  # PostgreSQL 16 (multi-arch: ARM64/AMD64)
+  # postgres:
+  #   image: postgres:16
+  #   container_name: postgres
+  #   # On Apple Silicon you can force native ARM if Docker guesses wrong:
+  #   # platform: linux/arm64/v8
+  #   environment:
+  #     - POSTGRES_PASSWORD=SuperSecurePassword123
+  #     - POSTGRES_DB=testdb
+  #     # Optional:
+  #     # - POSTGRES_USER=appuser
+  #     # - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=en_US.utf8
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - pg_data:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U postgres"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+volumes:
+  mysql_data:
+  mssql_data:
+  pg_data:

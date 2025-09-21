@@ -1,0 +1,127 @@
+# cloudbuild.yaml - Cloud Source Repositories (or other GCP‑connected repo)
+#                    → Google Cloud Build → GCE VM deploy
+#
+# WHAT THIS PIPELINE DOES
+# 1) Runs on Google Cloud Build when your GCP repo (Cloud Source Repositories)
+#    receives a push (via a Cloud Build Trigger).
+# 2) Builds a deployment bundle (scripts/ + app/) and uploads it to GCS.
+# 3) Uses `gcloud compute ssh` from inside Cloud Build to connect to a target
+#    GCE VM (optionally via IAP) and runs an on‑VM orchestrator that executes:
+#      stop → before_install → rsync → after_install → start → validate
+#
+# SECURITY
+# - NO long‑lived keys. Cloud Build uses the build's Service Account identity.
+# - Prefer **OS Login** and **IAP tunneling** for SSH; avoid public IPs.
+#
+# REQUIREMENTS
+# - A Cloud Build **Trigger** connected to your GCP repository (CSR), configured
+#   to run this `cloudbuild.yaml` on your release branch (e.g., main).
+# - A **Service Account** used by Cloud Build (the "Cloud Build Service Account"
+#   or a custom SA) that has the required roles:
+#     - roles/storage.objectAdmin (scoped to your deployment bucket/prefix)
+#     - roles/compute.osAdminLogin (OS Login sudo on the VM)
+#     - roles/compute.instanceAdmin.v1 (start/stop/ssh metadata if needed)
+#     - roles/iap.tunnelResourceAccessor (ONLY if tunneling through IAP)
+# - Enabled APIs: cloudbuild.googleapis.com, compute.googleapis.com,
+#                 storage.googleapis.com, iam.googleapis.com, iamcredentials.googleapis.com
+#
+# NOTES
+# - There is **no appspec.yml** on GCP; that's an AWS CodeDeploy concept.
+# - Long commands are split for readability.
+#
+# Substitutions (Vars)
+# You can set/override these in the Cloud Build Trigger UI as substitution vars.
+# Example: _PROJECT_ID=acme-prod, _GCS_BUCKET=acme-deploys, etc.
+
+substitutions:
+  _PROJECT_ID: "your-project-id"
+  _GCS_BUCKET: "your-deploy-bucket"
+  _BLOB_PREFIX: "releases/your-app/"          # include trailing slash for convenience
+  _PACKAGE_NAME: "bundle-$COMMIT_SHA.zip"
+  _GCE_INSTANCE: "your-instance-name"
+  _GCE_ZONE: "us-central1-a"
+  _APP_DIR: "/var/www/your-app"
+  _USE_IAP: "true"                            # "true" to SSH via IAP; "false" to use direct IP
+
+# Use a recent Cloud SDK image (has gcloud, gsutil).
+# Alternatively, you can use separate steps with debian + apt-get install google-cloud-cli.
+steps:
+  # 1) Package the deployment bundle (scripts/ + app/) to /workspace/dist/<zip>
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+    id: "package-bundle"
+    entrypoint: "bash"
+    args:
+      - "-lc"
+      - |
+        set -euo pipefail
+        echo "[package] Packaging scripts/ + app/…"
+        mkdir -p dist
+        zip -r "dist/${_PACKAGE_NAME}"
+          scripts/
+          app/
+        ls -lh dist
+
+  # 2) Upload the bundle to GCS
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+    id: "upload-bundle"
+    entrypoint: "bash"
+    args:
+      - "-lc"
+      - |
+        set -euo pipefail
+        echo "[deploy] Uploading to gs://${_GCS_BUCKET}/${_BLOB_PREFIX}${_PACKAGE_NAME}"
+        gsutil cp "dist/${_PACKAGE_NAME}"
+          "gs://${_GCS_BUCKET}/${_BLOB_PREFIX}${_PACKAGE_NAME}"
+
+  # 3) SSH into the GCE VM (IAP optional) and run the orchestrator
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+    id: "ssh-and-deploy"
+    entrypoint: "bash"
+    args:
+      - "-lc"
+      - |
+        set -euo pipefail
+        gcloud config set project "${_PROJECT_ID}"
+
+        EXTRA_FLAGS=""
+        if [[ "${_USE_IAP}" == "true" ]]; then
+          EXTRA_FLAGS="--tunnel-through-iap"
+        fi
+
+        echo "[deploy] Connecting to VM '${_GCE_INSTANCE}' (zone ${_GCE_ZONE})…"
+        gcloud compute ssh ${EXTRA_FLAGS} "${_GCE_INSTANCE}"
+          --zone "${_GCE_ZONE}"
+          --command '
+            sudo bash -lc "
+              set -euo pipefail
+
+              # Prepare a clean work dir
+              mkdir -p /tmp/deploy
+              cd /tmp/deploy
+              rm -rf extracted && mkdir -p extracted
+
+              echo "[GCP-DEPLOY] Downloading bundle from GCS…"
+              gsutil cp gs://${_GCS_BUCKET}/${_BLOB_PREFIX}${_PACKAGE_NAME} /tmp/deploy/bundle.zip
+
+              echo "[GCP-DEPLOY] Unzipping bundle…"
+              unzip -o /tmp/deploy/bundle.zip -d extracted
+
+              echo "[GCP-DEPLOY] Making scripts executable…"
+              chmod +x extracted/scripts/*.sh
+
+              export APP_DIR="${_APP_DIR}"
+
+              echo "[GCP-DEPLOY] Running orchestrator…"
+              bash extracted/scripts/gcp_vm_run_deploy.sh
+            "
+          '
+
+# Optional: Specify the service account to run Cloud Build with. If omitted,
+# Cloud Build uses the project's default Cloud Build Service Account:
+#   <PROJECT_NUMBER>@cloudbuild.gserviceaccount.com
+# Make sure that SA has the roles listed in the header above.
+#
+# serviceAccount: "projects/${_PROJECT_ID}/serviceAccounts/deployer-sa@${_PROJECT_ID}.iam.gserviceaccount.com"
+
+# Timeout for the entire build (increase for heavier deploys).
+timeout: "1200s"

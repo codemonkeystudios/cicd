@@ -1,0 +1,143 @@
+# GitLab CI/CD → Google Cloud Platform (GCE VM)
+#
+# WHAT THIS PIPELINE DOES
+# 1) Uses GitLab OIDC to obtain a short‑lived ID token in CI (no JSON keys).
+# 2) Exchanges that token via **Workload Identity Federation (WIF)** for Google
+#    credentials that impersonate a Service Account (SA).
+# 3) Packages a deployment bundle (scripts/ + app/) as a ZIP and uploads it to
+#    Google Cloud Storage (GCS).
+# 4) SSHes into a GCE VM (optionally through IAP) and runs an on‑VM orchestrator
+#    that executes lifecycle hooks in order:
+#    stop → before_install → rsync → after_install → start → validate.
+#
+# PREREQUISITES (ONE‑TIME GCP SETUP)
+# - Workload Identity Pool + Provider that trusts **gitlab.com** as OIDC issuer.
+# - A Service Account granted minimum roles (scope down to resources where possible):
+#     roles/storage.objectAdmin    (or objectCreator/uploader + reader on bucket/prefix)
+#     roles/compute.osAdminLogin   (sudo via OS Login) and roles/compute.instanceAdmin.v1
+#     roles/iap.tunnelResourceAccessor   (ONLY if tunneling SSH via IAP)
+# - Enable APIs: iam, iamcredentials, storage, compute.
+# - Target VM reachable via public IP OR IAP. OS Login recommended if using IAP.
+#
+# IMPORTANT OIDC/WIF NOTES
+# - We request a GitLab OIDC token (see `id_tokens:`) into $GCP_ID_TOKEN with a
+#   specific **audience (aud)** value. Configure your WIF Provider to accept this
+#   audience. Many teams simply use the provider's full resource as audience:
+#   //iam.googleapis.com/projects/<NUM>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>
+# - We then create a temporary **external_account** credential JSON that points at
+#   that ID token file and impersonates your deploy Service Account.
+
+image: ubuntu:22.04
+
+# Variables to edit
+variables:
+  # GCP project + WIF provider + SA to impersonate
+  GCP_PROJECT_ID: "your-project-id"
+  WIF_PROVIDER_RESOURCE: "projects/1234567890/locations/global/workloadIdentityPools/POOL/providers/GITLAB"  # ← CHANGE
+  IMPERSONATE_SERVICE_ACCOUNT: "deployer-sa@your-project-id.iam.gserviceaccount.com"                           # ← CHANGE
+
+  # GCS bucket where deployment bundles are stored
+  GCS_BUCKET: "your-deploy-bucket"                 # must already exist
+  GCS_PREFIX: "releases/your-app/"                 # can be empty; end with '/' when convenient
+
+  # Target VM + deployment details
+  GCE_INSTANCE: "your-instance-name"
+  GCE_ZONE: "us-central1-a"
+  APP_DIR: "/var/www/your-app"                     # where app files live on VM
+  PACKAGE_NAME: "bundle-$CI_COMMIT_SHA.zip"
+  USE_IAP: "false"                                  # set "true" to tunnel SSH via IAP
+
+# Request a GitLab OIDC ID token
+# The token will be injected into $GCP_ID_TOKEN (as plaintext JWT) at runtime.
+# Set the audience (`aud`) to a value your WIF provider accepts (see notes).
+id_tokens:
+  GCP_ID_TOKEN:
+    aud: "//iam.googleapis.com/${WIF_PROVIDER_RESOURCE}"
+
+stages:
+  - package
+  - deploy
+
+# Shared setup for jobs
+before_script:
+  - set -euo pipefail
+  - apt-get update -y
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends       ca-certificates curl unzip zip jq rsync google-cloud-cli
+
+  # Create a short-lived external_account credentials file that references
+  # the GitLab OIDC token and impersonates your Service Account.
+  - |
+    echo "[auth] Creating external_account credentials (WIF)…"
+    mkdir -p /tmp/wif && chmod 700 /tmp/wif
+    echo -n "$GCP_ID_TOKEN" > /tmp/wif/idtoken.jwt
+    cat > /tmp/wif/cred.json <<'JSON'
+    {
+      "type": "external_account",
+      "audience": "//iam.googleapis.com/${WIF_PROVIDER_RESOURCE}",
+      "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+      "token_url": "https://sts.googleapis.com/v1/token",
+      "credential_source": {
+        "file": "/tmp/wif/idtoken.jwt"
+      },
+      "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${IMPERSONATE_SERVICE_ACCOUNT}:generateAccessToken"
+    }
+    JSON
+    export GOOGLE_APPLICATION_CREDENTIALS=/tmp/wif/cred.json
+    gcloud auth login --brief --cred-file="$GOOGLE_APPLICATION_CREDENTIALS"
+    gcloud config set project "$GCP_PROJECT_ID"
+
+package:
+  stage: package
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - echo "[package] Creating deployment bundle…"
+    - mkdir -p dist
+    - |
+      # We intentionally package ONLY scripts/ and app/ - there is no appspec.yml on GCP.
+      zip -r "dist/$PACKAGE_NAME"         scripts/         app/
+    - echo "[package] Bundle created: dist/$PACKAGE_NAME"
+  artifacts:
+    when: on_success
+    expire_in: 1 week
+    paths:
+      - dist/$PACKAGE_NAME
+
+deploy:
+  stage: deploy
+  needs: ["package"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    # Upload bundle to GCS
+    - |
+      set -euo pipefail
+      echo "[deploy] Uploading to gs://${GCS_BUCKET}/${GCS_PREFIX}${PACKAGE_NAME}"
+      gsutil cp "dist/${PACKAGE_NAME}"         "gs://${GCS_BUCKET}/${GCS_PREFIX}${PACKAGE_NAME}"
+
+    # SSH into VM and orchestrate
+    - |
+      set -euo pipefail
+      echo "[deploy] Connecting to VM '${GCE_INSTANCE}' in zone '${GCE_ZONE}'…"
+      EXTRA=""
+      if [ "${USE_IAP}" = "true" ]; then
+        EXTRA="--tunnel-through-iap"
+      fi
+      gcloud compute ssh ${EXTRA} "${GCE_INSTANCE}"         --zone "${GCE_ZONE}"         --command '
+          sudo bash -lc "
+            set -euo pipefail
+            mkdir -p /tmp/deploy && cd /tmp/deploy
+            rm -rf extracted && mkdir -p extracted
+
+            echo "[GCP-DEPLOY] Downloading bundle from GCS…"
+            gsutil cp gs://${GCS_BUCKET}/${GCS_PREFIX}${PACKAGE_NAME} /tmp/deploy/bundle.zip
+
+            echo "[GCP-DEPLOY] Unzipping bundle…"
+            unzip -o /tmp/deploy/bundle.zip -d extracted
+            chmod +x extracted/scripts/*.sh
+
+            echo "[GCP-DEPLOY] Running orchestrator…"
+            export APP_DIR="${APP_DIR}"
+            bash extracted/scripts/gcp_vm_run_deploy.sh
+          "
+        '

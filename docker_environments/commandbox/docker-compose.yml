@@ -1,0 +1,106 @@
+version: "3.9"
+
+services:
+  commandbox:
+    # Ortus CommandBox image runs CFML (ACF or Lucee) via env flags
+    image: ortussolutions/commandbox:latest
+    container_name: commandbox
+    # Expose the built-in web server
+    ports:
+      - "8080:8080"   # your app: http://localhost:8080
+      - "8443:8443"   # optional HTTPS if you enable it
+    environment:
+      # Choose engine: lucee@5, lucee@6, adobecoldfusion@2023, etc.
+      - CFENGINE=lucee@6
+      # If you want CommandBox to auto-start a server
+      - PORT=8080
+      - SSL_PORT=8443
+      # Example datasource env vars you can read in your app (CFConfig or code)
+      - DB_CLIENT=mysql            # or mssql / postgres
+      - DB_HOST=mysql              # match service name you enable below
+      - DB_PORT=3306               # 1433 (MSSQL), 5432 (Postgres)
+      - DB_DATABASE=testdb
+      - DB_USER=root
+      - DB_PASSWORD=SuperSecurePassword123
+      # Speeds up first-run by skipping prompts
+      - ACCEPT_EULA=Y
+    volumes:
+      - ./app:/app                 # your CFML code lives here
+      - ./.commandbox:/root/.CommandBox  # cache artifacts between runs
+    # Uncomment one of the depends_on lines when you enable a DB service
+    # depends_on:
+    #   - mysql
+    # depends_on:
+    #   - mssql
+    # depends_on:
+    #   - postgres
+
+  # CHOOSE ONE DATABASE BELOW AND UNCOMMENT IT
+
+  # MySQL 8 (multi-arch: ARM64/AMD64) — recommended for Apple Silicon
+  # mysql:
+  #   image: mysql:8.0
+  #   container_name: mysql
+  #   # Apple Silicon runs this natively; you can force if needed:
+  #   # platform: linux/arm64/v8
+  #   environment:
+  #     - MYSQL_ROOT_PASSWORD=SuperSecurePassword123
+  #     - MYSQL_DATABASE=testdb
+  #     # Optional: create an app user instead of using root
+  #     # - MYSQL_USER=appuser
+  #     # - MYSQL_PASSWORD=AppUserPassword!
+  #   ports:
+  #     - "3306:3306"
+  #   volumes:
+  #     - mysql_data:/var/lib/mysql
+  #   healthcheck:
+  #     test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+  # Microsoft SQL Server 2022 (AMD64 only) — emulation on Apple Silicon
+  # mssql:
+  #   image: mcr.microsoft.com/mssql/server:2022-latest
+  #   container_name: mssql
+  #   platform: linux/amd64   # REQUIRED on Apple Silicon (no ARM build)
+  #   environment:
+  #     - ACCEPT_EULA=Y
+  #     - SA_PASSWORD=SuperSecurePassword123
+  #     - MSSQL_PID=Developer
+  #   ports:
+  #     - "1433:1433"
+  #   volumes:
+  #     - mssql_data:/var/opt/mssql
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P SuperSecurePassword123 -No -Q \"SELECT 1\" -C || exit 1"]
+  #     interval: 15s
+  #     timeout: 10s
+  #     retries: 6
+
+  # PostgreSQL 16 (multi-arch: ARM64/AMD64)
+  # postgres:
+  #   image: postgres:16
+  #   container_name: postgres
+  #   # Apple Silicon runs this natively; you can force if needed:
+  #   # platform: linux/arm64/v8
+  #   environment:
+  #     - POSTGRES_PASSWORD=SuperSecurePassword123
+  #     - POSTGRES_DB=testdb
+  #     # Optional:
+  #     # - POSTGRES_USER=appuser
+  #     # - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=en_US.utf8
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - pg_data:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U postgres"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+volumes:
+  mysql_data:
+  mssql_data:
+  pg_data:

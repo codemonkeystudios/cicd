@@ -1,0 +1,88 @@
+# Bitbucket Pipelines → Google Cloud Platform (GCE VM)
+image: atlassian/default-image:3
+
+options:
+  size: 2x
+  max-time: 60
+
+pipelines:
+  branches:
+    main:
+      - step:
+          name: Package deployment bundle
+          oidc: true
+          caches: [apt]
+          script:
+            - |
+              set -euo pipefail
+              sudo apt-get update -y
+              sudo apt-get install -y zip
+              mkdir -p dist
+              zip -r "dist/bundle-${BITBUCKET_COMMIT}.zip" scripts/ app/
+          artifacts:
+            - dist/**
+      - step:
+          name: Deploy to GCE via WIF + SSH
+          oidc: true
+          caches: [apt]
+          script:
+            - |
+              set -euo pipefail
+              sudo apt-get update -y
+              sudo apt-get install -y curl jq unzip rsync google-cloud-cli
+            - |
+              set -euo pipefail
+              echo "[auth] Fetching Bitbucket OIDC token…"
+              ID_TOKEN="$(curl -sS --retry 3 --fail "$BITBUCKET_STEP_OIDC_TOKEN")"
+              echo "[auth] Creating temporary external_account credentials for WIF…"
+              mkdir -p /tmp/wif && chmod 700 /tmp/wif
+              echo -n "${ID_TOKEN}" > /tmp/wif/idtoken.jwt
+              cat > /tmp/wif/cred.json <<'JSON'
+              {
+                "type": "external_account",
+                "audience": "//iam.googleapis.com/${WIF_PROVIDER_RESOURCE}",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": "https://sts.googleapis.com/v1/token",
+                "credential_source": { "file": "/tmp/wif/idtoken.jwt" },
+                "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${IMPERSONATE_SERVICE_ACCOUNT}:generateAccessToken"
+              }
+              JSON
+              export GOOGLE_APPLICATION_CREDENTIALS=/tmp/wif/cred.json
+              gcloud auth login --brief --cred-file="$GOOGLE_APPLICATION_CREDENTIALS"
+              gcloud config set project "$GCP_PROJECT_ID"
+            - |
+              set -euo pipefail
+              echo "[deploy] Uploading to gs://${GCS_BUCKET}/${GCS_PREFIX}bundle-${BITBUCKET_COMMIT}.zip"
+              gsutil cp "dist/bundle-${BITBUCKET_COMMIT}.zip" "gs://${GCS_BUCKET}/${GCS_PREFIX}bundle-${BITBUCKET_COMMIT}.zip"
+            - |
+              set -euo pipefail
+              echo "[deploy] Connecting to VM '${GCE_INSTANCE}' in zone '${GCE_ZONE}'…"
+              EXTRA=""
+              if [ "${USE_IAP}" = "true" ]; then
+                EXTRA="--tunnel-through-iap"
+              fi
+              gcloud compute ssh ${EXTRA} "${GCE_INSTANCE}"
+                --zone "${GCE_ZONE}"
+                --command '
+                  sudo bash -lc "
+                    set -euo pipefail
+                    mkdir -p /tmp/deploy && cd /tmp/deploy
+                    rm -rf extracted && mkdir -p extracted
+                    gsutil cp gs://${GCS_BUCKET}/${GCS_PREFIX}bundle-${BITBUCKET_COMMIT}.zip /tmp/deploy/bundle.zip
+                    unzip -o /tmp/deploy/bundle.zip -d extracted
+                    chmod +x extracted/scripts/*.sh
+                    export APP_DIR=\"${APP_DIR}\"
+                    bash extracted/scripts/gcp_vm_run_deploy.sh
+                  "
+                '
+
+# Repository variables to define (Settings → Variables):
+#   GCP_PROJECT_ID
+#   WIF_PROVIDER_RESOURCE
+#   IMPERSONATE_SERVICE_ACCOUNT
+#   GCS_BUCKET
+#   GCS_PREFIX
+#   GCE_INSTANCE
+#   GCE_ZONE
+#   APP_DIR
+#   USE_IAP

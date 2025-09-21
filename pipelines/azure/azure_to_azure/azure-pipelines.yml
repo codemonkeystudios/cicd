@@ -1,0 +1,149 @@
+# Azure Repos (Azure DevOps) → Microsoft Azure (Linux VM via AAD SSH)
+#
+# WHAT THIS PIPELINE DOES
+# 1) Runs in Azure Pipelines on commits to your chosen branch (e.g., main).
+# 2) Uses an Azure DevOps **Service Connection** configured with **OIDC / Federated
+#    Credentials** (no client secret) to log in to Azure (via AzureCLI@2).
+# 3) Creates a deployment ZIP (scripts/ + app/).
+# 4) Uploads that ZIP to Azure Blob Storage and generates a short‑lived **read‑only SAS**.
+# 5) SSHes into an Azure Linux VM using **AAD‑based SSH** (az ssh vm) and runs an
+#    on‑VM orchestrator that executes lifecycle hooks in order:
+#      stop → before_install → rsync → after_install → start → validate.
+#
+# PREREQUISITES (ONE‑TIME SETUP)
+# • Create an Azure DevOps Service Connection of type **Azure Resource Manager**:
+#     - Authentication method: **Workload Identity (OIDC)** (Federated Credentials)
+#     - Scope: Subscription or Resource Group, least privilege.
+# • Assign least‑privilege roles to the Service Principal behind the Service Connection:
+#     - Storage Blob Data Contributor (on your storage account or container)
+#     - Virtual Machine Administrator Login (or VM User Login + sudo policy) on the VM/RG
+#     - (Optional) Reader on the VM resource group
+# • Target VM has **AADLoginForLinux** extension enabled (for AAD SSH).
+# • Storage account + container exist.
+#
+# SECURITY NOTES
+# • No long‑lived client secrets. The service connection uses OIDC.
+# • We generate a short‑lived **SAS** for the deployed blob and pass the SAS URL
+#   to the VM. In production, prefer private networking and VM Managed Identity.
+
+trigger:
+  branches:
+    include:
+      - main     # ← change to your release branch(es)
+
+# You can run on Microsoft-hosted agents. ubuntu-latest includes zip/unzip.
+pool:
+  vmImage: ubuntu-latest
+
+# Pipeline Variables
+# You can override these in the GUI (Variables) or via Variable Groups.
+variables:
+  # Name of your Azure DevOps service connection (OIDC / Federated)
+  AZURE_SERVICE_CONNECTION: "azure-oidc-conn"     # ← CHANGE to your service connection name
+
+  # Storage for bundles
+  AZURE_STORAGE_ACCOUNT: "yourstorageacct"        # must exist
+  AZURE_STORAGE_CONTAINER: "releases"             # must exist
+  BLOB_PREFIX: "your-app/"                        # optional prefix; can be empty
+  PACKAGE_NAME: "bundle-$(Build.SourceVersion).zip"
+  SAS_EXPIRY_MINUTES: "30"                        # short‑lived SAS window
+
+  # Target VM details
+  AZ_RESOURCE_GROUP: "your-rg"
+  AZ_VM_NAME: "your-vm-name"
+  AZ_VM_LOCATION: "eastus"                        # used by az ssh vm
+  APP_DIR: "/var/www/your-app"                    # where app files live on the VM
+
+stages:
+  # Stage 1: Package
+  - stage: Package
+    displayName: "Package deployment bundle"
+    jobs:
+      - job: package
+        displayName: "Zip scripts/ + app/"
+        steps:
+          # Ensure repo is checked out
+          - checkout: self
+
+          # Create dist/ and zip the payload
+          - script: |
+              set -euo pipefail
+              mkdir -p dist
+              echo "[package] Zipping scripts/ + app/ to dist/$(PACKAGE_NAME)"
+              zip -r "dist/$(PACKAGE_NAME)" scripts/ app/
+              ls -lh dist
+            displayName: "Build ZIP bundle"
+
+          # Publish artifact so the next stage can download it
+          - publish: dist
+            artifact: bundle
+            displayName: "Publish bundle artifact"
+
+  # Stage 2: Deploy
+  - stage: Deploy
+    displayName: "Deploy to Azure VM via AAD SSH"
+    dependsOn: Package
+    condition: succeeded()
+    jobs:
+      - job: deploy
+        displayName: "Upload + SSH Orchestration"
+        steps:
+          # Download the published artifact
+          - download: current
+            artifact: bundle
+            displayName: "Download bundle artifact"
+
+          # Azure CLI authenticated via the OIDC-based service connection
+          - task: AzureCLI@2
+            displayName: "Upload to Blob + generate SAS"
+            inputs:
+              azureSubscription: "$(AZURE_SERVICE_CONNECTION)"   # OIDC service connection name
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                CONTAINER="$(AZURE_STORAGE_CONTAINER)"
+                ACCOUNT="$(AZURE_STORAGE_ACCOUNT)"
+                NAME="$(BLOB_PREFIX)$(PACKAGE_NAME)"
+
+                echo "[storage] Uploading ${NAME} to container ${CONTAINER} in account ${ACCOUNT}"
+                az storage blob upload                   --account-name "${ACCOUNT}"                   --container-name "${CONTAINER}"                   --name "${NAME}"                   --file "$(Pipeline.Workspace)/bundle/$(PACKAGE_NAME)"                   --auth-mode login                   --overwrite true                   --only-show-errors
+
+                # Compute expiry time (UTC) for SAS
+                EXPIRY="$(date -u -d "+$(SAS_EXPIRY_MINUTES) minutes" +"%Y-%m-%dT%H:%MZ")"
+                echo "[storage] Generating read-only SAS valid until ${EXPIRY}"
+                SAS_TOKEN="$(az storage blob generate-sas                   --account-name "${ACCOUNT}"                   --container-name "${CONTAINER}"                   --name "${NAME}"                   --permissions r                   --expiry "${EXPIRY}"                   --auth-mode login                   --as-user                   --output tsv)"
+                SAS_URL="https://${ACCOUNT}.blob.core.windows.net/${CONTAINER}/${NAME}?${SAS_TOKEN}"
+                echo "##vso[task.setvariable variable=SAS_URL;issecret=true]${SAS_URL}"
+
+          # Use the same service connection to SSH to the VM and run the orchestrator
+          - task: AzureCLI@2
+            displayName: "SSH to VM and run orchestrator"
+            inputs:
+              azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                echo "[deploy] Connecting to VM '$(AZ_VM_NAME)' in RG '$(AZ_RESOURCE_GROUP)'…"
+                # --prefer-public-ip keeps it simple; for production consider Bastion/Private access
+                az ssh vm                   --name "$(AZ_VM_NAME)"                   --resource-group "$(AZ_RESOURCE_GROUP)"                   --local-user "azureuser"                   --prefer-public-ip                   --                   'sudo bash -lc "
+                     set -euo pipefail
+                     mkdir -p /tmp/deploy && cd /tmp/deploy
+                     rm -rf extracted && mkdir -p extracted
+
+                     echo "[AZ-DEPLOY] Downloading bundle via SAS…"
+                     curl -sSLo /tmp/deploy/bundle.zip "'$(SAS_URL)'"
+
+                     echo "[AZ-DEPLOY] Unzipping bundle…"
+                     unzip -o /tmp/deploy/bundle.zip -d extracted
+
+                     echo "[AZ-DEPLOY] Making scripts executable…"
+                     chmod +x extracted/scripts/*.sh
+
+                     export APP_DIR="'$(APP_DIR)'"
+                     echo "[AZ-DEPLOY] Running orchestrator…"
+                     bash extracted/scripts/az_vm_run_deploy.sh
+                   "'

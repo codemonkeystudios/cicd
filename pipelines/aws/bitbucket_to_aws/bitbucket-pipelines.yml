@@ -1,0 +1,82 @@
+# Bitbucket Pipelines → AWS CodeDeploy (EC2/On‑Prem)
+image: atlassian/default-image:3
+
+options:
+  size: 2x
+  max-time: 60
+
+pipelines:
+  branches:
+    main:
+      - step:
+          name: Package deployment bundle
+          oidc: true
+          caches: [apt]
+          script:
+            - |
+              set -euo pipefail
+              sudo apt-get update -y
+              sudo apt-get install -y zip
+              mkdir -p dist
+              zip -r "dist/bundle-${BITBUCKET_COMMIT}.zip"
+                 appspec.yml
+                 scripts/
+                 app/
+          artifacts:
+            - dist/**
+      - step:
+          name: Deploy via AWS CodeDeploy
+          oidc: true
+          caches: [apt]
+          script:
+            - |
+              set -euo pipefail
+              sudo apt-get update -y
+              sudo apt-get install -y curl jq unzip awscli
+            - |
+              set -euo pipefail
+              echo "[auth] Fetching Bitbucket OIDC token…"
+              ID_TOKEN="$(curl -sS --retry 3 --fail "$BITBUCKET_STEP_OIDC_TOKEN")"
+              echo "[auth] Assuming AWS role with web identity…"
+              CRED_JSON="$(aws sts assume-role-with-web-identity
+                 --role-arn "${AWS_ROLE_ARN}"
+                 --role-session-name "bb-pipelines-codedeploy-${BITBUCKET_BUILD_NUMBER}"
+                 --web-identity-token "${ID_TOKEN}"
+                 --duration-seconds 3600
+                 --query 'Credentials' --output json)"
+              export AWS_ACCESS_KEY_ID="$(echo "$CRED_JSON" | jq -r .AccessKeyId)"
+              export AWS_SECRET_ACCESS_KEY="$(echo "$CRED_JSON" | jq -r .SecretAccessKey)"
+              export AWS_SESSION_TOKEN="$(echo "$CRED_JSON" | jq -r .SessionToken)"
+              export AWS_DEFAULT_REGION="${AWS_REGION}"
+            - |
+              set -euo pipefail
+              echo "[deploy] Uploading bundle to s3://${S3_BUCKET}/${S3_KEY_PREFIX}/bundle-${BITBUCKET_COMMIT}.zip"
+              aws s3 cp "dist/bundle-${BITBUCKET_COMMIT}.zip"
+                 "s3://${S3_BUCKET}/${S3_KEY_PREFIX}/bundle-${BITBUCKET_COMMIT}.zip"
+            - |
+              set -euo pipefail
+              echo "[deploy] Creating CodeDeploy deployment…"
+              DEPLOYMENT_ID="$(aws deploy create-deployment
+                 --application-name "${CODEDEPLOY_APPLICATION}"
+                 --deployment-group-name "${CODEDEPLOY_DEPLOYMENT_GROUP}"
+                 --deployment-config-name "CodeDeployDefault.AllAtOnce"
+                 --s3-location
+                   bucket="${S3_BUCKET}",
+                  key="${S3_KEY_PREFIX}/bundle-${BITBUCKET_COMMIT}.zip",
+                  bundleType=zip
+                 --query "deploymentId" --output text)"
+              echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}"
+            - |
+              set -euo pipefail
+              echo "[deploy] Waiting for deployment to finish…"
+              aws deploy wait deployment-successful
+                 --deployment-id "${DEPLOYMENT_ID}"
+              echo "[deploy] Deployment completed successfully."
+
+# Variables to set in Bitbucket (Repository settings → Variables):
+#   AWS_REGION
+#   S3_BUCKET
+#   S3_KEY_PREFIX
+#   CODEDEPLOY_APPLICATION
+#   CODEDEPLOY_DEPLOYMENT_GROUP
+#   AWS_ROLE_ARN
